@@ -70,6 +70,7 @@ async def register_user(
         await db.commit()
         await db.refresh(new_user)
         return new_user
+
     except SQLAlchemyError:
         await db.rollback()
         raise HTTPException(
@@ -83,6 +84,10 @@ async def activate_user(
 ):
     email = cast(str, activation_data.email)
     db_user = await get_user_by_email(email, db)
+
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
     if db_user.is_active:
         raise HTTPException(status_code=400, detail="User account is already active.")
 
@@ -177,6 +182,7 @@ async def reset_password(
     try:
         db_user.password = reset_data.password
         db.add(db_user)
+        await db.delete(db_token)
         await db.commit()
     except SQLAlchemyError:
         await db.rollback()
@@ -223,7 +229,6 @@ async def refresh_access_token(
     jwt_manager = get_jwt_auth_manager(settings)
     try:
         payload = jwt_manager.decode_refresh_token(request.refresh_token)
-        print(payload)
     except (TokenExpiredError, InvalidTokenError):
         raise HTTPException(status_code=400, detail="Token has expired.")
 
