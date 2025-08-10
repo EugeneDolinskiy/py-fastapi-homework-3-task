@@ -6,7 +6,7 @@ from sqlalchemy import select, delete
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import get_jwt_auth_manager, get_settings
+from config import get_jwt_auth_manager, get_settings, BaseAppSettings
 from database import (
     get_db,
     UserModel,
@@ -28,6 +28,7 @@ from schemas import (
     TokenRefreshResponseSchema,
     TokenRefreshRequestSchema,
 )
+from security.interfaces import JWTAuthManagerInterface
 
 router = APIRouter()
 
@@ -86,7 +87,7 @@ async def activate_user(
     db_user = await get_user_by_email(email, db)
 
     if not db_user:
-        raise HTTPException(status_code=404, detail="User not found.")
+        raise HTTPException(status_code=400, detail="Invalid or expired activation token.")
 
     if db_user.is_active:
         raise HTTPException(status_code=400, detail="User account is already active.")
@@ -129,8 +130,8 @@ async def request_password_reset(
         db_pwd_reset_token = result.scalar_one_or_none()
         if db_pwd_reset_token:
             await db.delete(db_pwd_reset_token)
-            await db.commit()
             await db.refresh(db_user)
+            await db.commit()
 
         new_pwd_reset_token = PasswordResetTokenModel(user_id=db_user.id)
         db.add(new_pwd_reset_token)
@@ -193,7 +194,12 @@ async def reset_password(
 
 
 @router.post("/login/", status_code=201, response_model=UserLoginResponseSchema)
-async def login(user_data: UserLoginRequestSchema, db: AsyncSession = Depends(get_db)):
+async def login(
+    user_data: UserLoginRequestSchema,
+    db: AsyncSession = Depends(get_db),
+    jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
+    settings: BaseAppSettings = Depends(get_settings)
+):
     email = cast(str, user_data.email)
     db_user = await get_user_by_email(email, db)
     if not db_user or not db_user.verify_password(user_data.password):
@@ -201,14 +207,14 @@ async def login(user_data: UserLoginRequestSchema, db: AsyncSession = Depends(ge
     if not db_user.is_active:
         raise HTTPException(status_code=403, detail="User account is not activated.")
 
-    settings = get_settings()
-    jwt_manager = get_jwt_auth_manager(settings)
     try:
         data = {"sub": email, "user_id": db_user.id}
         access_token = jwt_manager.create_access_token(data)
         refresh_token = jwt_manager.create_refresh_token(data)
         db_refresh_token = RefreshTokenModel.create(
-            user_id=db_user.id, days_valid=1, token=refresh_token
+            user_id=db_user.id,
+            days_valid=settings.LOGIN_TIME_DAYS,
+            token=refresh_token
         )
         db.add(db_refresh_token)
         await db.commit()
@@ -223,10 +229,10 @@ async def login(user_data: UserLoginRequestSchema, db: AsyncSession = Depends(ge
 
 @router.post("/refresh/", response_model=TokenRefreshResponseSchema)
 async def refresh_access_token(
-    request: TokenRefreshRequestSchema, db: AsyncSession = Depends(get_db)
+    request: TokenRefreshRequestSchema,
+    db: AsyncSession = Depends(get_db),
+    jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
 ):
-    settings = get_settings()
-    jwt_manager = get_jwt_auth_manager(settings)
     try:
         payload = jwt_manager.decode_refresh_token(request.refresh_token)
     except (TokenExpiredError, InvalidTokenError):
